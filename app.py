@@ -1,28 +1,23 @@
-from shiny import App, render, ui, reactive
+import dash
+from dash import dcc, html, Input, Output
+import dash_bootstrap_components as dbc
 import pandas as pd
-import matplotlib.pyplot as plt
-from ipyleaflet import Map, Marker, MarkerCluster, Popup
-from sqlalchemy import create_engine
+import plotly.express as px
+from sqlalchemy import create_engine, text
 from dotenv import dotenv_values
-from ipywidgets.embed import embed_minimal_html
-import ipywidgets as widgets  # Importar ipywidgets
 
 # Cargar variables de entorno desde el archivo .env
 config = dotenv_values('/home/chris/.env')
 
 # Función para conectarse a la base de datos
 def conectar_bd():
-    db_host = config.get('DB_HOST')
-    db_name = config.get('DB_NAME')
-    db_user = config.get('DB_USER')
-    db_password = config.get('DB_PASSWORD')
+    db_host = config.get('DB_HOST_P')
+    db_name = config.get('DB_NAME_P')
+    db_user = config.get('DB_USER_P')
+    db_password = config.get('DB_PASSWORD_P')
 
     if not all([db_host, db_name, db_user, db_password]):
         print("Falta una o más variables de entorno necesarias para la conexión a la base de datos.")
-        print(f"DB_HOST: {db_host}")
-        print(f"DB_NAME: {db_name}")
-        print(f"DB_USER: {db_user}")
-        print(f"DB_PASSWORD: {db_password}")
         return None
 
     connection_string = f"postgresql://{db_user}:{db_password}@{db_host}/{db_name}"
@@ -31,133 +26,156 @@ def conectar_bd():
 # Crear la conexión a la base de datos
 engine = conectar_bd()
 
-# Función para consultar datos desde la base de datos
-def fetch_data(query):
-    if engine is None:
-        return pd.DataFrame()
-    with engine.connect() as connection:
-        result = pd.read_sql(query, connection)
-    return result
-
-# Consulta para obtener los datos del mapa
-map_query = """
-SELECT p.objectid,
-    p.cod_estacion,
-    p.nombre,
-    p.altitud,
-    r.region,
-    c.comuna,
-    s.nombre AS sscuenca_dga,
-    p.zona,
-    st_transform(p.geometria, 4326) AS geometria,
-    st_y(p.geometria) AS latitud,
-    st_x(p.geometria) AS longitud,
-    st_srid(p.geometria) AS cod_epsg
-   FROM datos_maestros.estacion_punto_monitoreo p
-     JOIN datos_maestros.dpa_comuna_subdere c ON p.id_comuna = c.id_dpa_comuna
-     JOIN datos_maestros.dga_subsub_cuenca s ON p.id_sscuenca = s.objectid
-     JOIN datos_maestros.dpa_provincia_subdere ps ON ps.objectid = c.id_provincia
-     JOIN datos_maestros.dpa_region_subdere r ON r.objectid = ps.id_region
-  WHERE p.institucion::text = 'DMC'::text;
-"""
-
-# Consulta para obtener los datos del gráfico
-def fetch_graph_data(cod_estacion):
-    graph_query = f"""
-    SELECT r.region, c.comuna, s.nombre AS sscuenca_dga, p.cod_estacion, p.nombre AS nombre_estacion, p.zona, p.altitud as "altitud (m.s.n.m)", 
-    ROUND(re.temperatura::numeric, 2) as "temperatura (°C)", re.humedad_relativa as "humedad_relativa (%)", re.presion as "presion_atmosferica (mbar)", 
-    re.direccion_viento as "direccion_viento (°)", re.velocidad_viento as "fuerza_viento (kt)", re.precipitacion as "precipitación (mm)", 
-    NULLIF(re.radiacion, 'NaN') AS "radiacion (W/m²)", re.fecha
+# Función para consultar datos de las geometrías
+def obtener_geometrias(engine):
+    query = """
+    SELECT 
+        p.cod_estacion AS "codigo de estacion", p.nombre AS "nombre de estacion", r.region AS "region", c.comuna AS "comuna", cd.nombre AS "cuenca DGA", s.nombre AS "sscuenca DGA", p.zona AS "zona", p.altitud AS "altitud (m.s.n.m)", ST_Transform(p.geometria, 4326) AS geometria,
+        ST_Y(p.geometria) AS latitud, ST_X(p.geometria) AS longitud
     FROM datos_maestros.estacion_punto_monitoreo p
-    INNER JOIN medio_fisico.registro_monitoreo re ON p.objectid = re.objectid
     INNER JOIN datos_maestros.dpa_comuna_subdere c ON p.id_comuna = c.id_dpa_comuna
     INNER JOIN datos_maestros.dga_subsub_cuenca s ON p.id_sscuenca = s.objectid
+    INNER JOIN datos_maestros.dga_sub_cuenca sc ON s.id_scuenca = sc.objectid
+    INNER JOIN datos_maestros.dga_cuenca cd ON sc.id_cuenca = cd.objectid
     INNER JOIN datos_maestros.dpa_provincia_subdere ps ON ps.objectid = c.id_provincia
     INNER JOIN datos_maestros.dpa_region_subdere r ON r.objectid = ps.id_region
-    WHERE p.institucion = 'DMC' AND EXTRACT(YEAR FROM re.fecha) = 2023 AND r.objectid = 16 AND p.cod_estacion = '{cod_estacion}'
-    ORDER BY p.cod_estacion ASC;
+    WHERE p.institucion = 'DMC' AND c.comuna = 'Antofagasta';
     """
-    return fetch_data(graph_query)
+    with engine.connect() as conn:
+        geometrias_df = pd.read_sql_query(text(query), conn)
+    return geometrias_df
 
-# Obtener los datos para el mapa
-map_data = fetch_data(map_query)
+# Función para consultar datos históricos
+def obtener_datos_historicos(engine):
+    query = """
+    SELECT re.cod_estacion AS "codigo de estacion",
+        to_char(re.fecha, 'YYYY-MM') AS "mes",
+        to_char(re.fecha, 'TMMonth "de" YYYY') AS "mes_formateado",
+        ROUND(re.temperatura::numeric, 2) AS "temperatura (°C)",
+        ROUND(re.humedad_relativa::numeric, 1) AS "humedad relativa (%)",
+        ROUND(re.presion::numeric, 2) AS "presión atmosferica (hPAS)",
+        ROUND(re.direccion_viento::numeric, 2) AS "direccion viento (°)",
+        ROUND(re.fuerza_viento::numeric, 2) AS "fuerza viento (kt)",
+        ROUND(re.precipitacion::numeric, 2) AS "precipitación (mm)",
+        ROUND(NULLIF(re.radiacion, 'NaN')::numeric, 2) AS "radiacion (W/m²)"
+    FROM 
+        medio_fisico.registro_monitoreo re
+    INNER JOIN 
+        datos_maestros.estacion_punto_monitoreo p ON p.cod_estacion = re.cod_estacion AND p.objectid = re.objectid
+    INNER JOIN 
+        datos_maestros.dpa_comuna_subdere c ON p.id_comuna = c.id_dpa_comuna
+    WHERE 
+        p.institucion = 'DMC' 
+        AND c.comuna = 'Antofagasta' 
+        AND to_char(re.fecha, 'YYYY') = '2023';
+    """
+    with engine.connect() as conn:
+        datos_historicos_df = pd.read_sql_query(text(query), conn)
+    return datos_historicos_df
+
+# Obtener los datos
+geometrias_df = obtener_geometrias(engine)
+datos_historicos_df = obtener_datos_historicos(engine)
+
+# Crear diccionario para mapear nombres de estación a códigos
+estacion_a_codigo = geometrias_df.set_index('nombre de estacion')['codigo de estacion'].to_dict()
+
+# Verificar columnas de los DataFrames
+print("Columnas de geometrias_df:", geometrias_df.columns)
+print("Columnas de datos_historicos_df:", datos_historicos_df.columns)
 
 # Calcular el bounding box del mapa
-min_lat = map_data['latitud'].min()
-max_lat = map_data['latitud'].max()
-min_lon = map_data['longitud'].min()
-max_lon = map_data['longitud'].max()
+min_lat = geometrias_df['latitud'].min()
+max_lat = geometrias_df['latitud'].max()
+min_lon = geometrias_df['longitud'].min()
+max_lon = geometrias_df['longitud'].max()
 bounds = [[min_lat, min_lon], [max_lat, max_lon]]
 
-# Definir la interfaz de usuario (UI)
-app_ui = ui.page_fluid(
-    ui.layout_sidebar(
-        ui.panel_sidebar(
-            ui.input_slider("n", "Número de datos a mostrar", 1, 100, 10)
-        ),
-        ui.panel_main(
-            ui.output_ui("map"),
-            ui.output_plot("plot"),
-            ui.output_table("table")
-        )
-    )
+# Inicializar la aplicación Dash
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+
+# Diseño de la aplicación
+app.layout = dbc.Container([
+    dbc.Row([
+        dbc.Col([
+            html.Label("Selecciona una variable"),
+            dcc.Dropdown(
+                id='variable-dropdown',
+                options=[
+                    {'label': 'Temperatura (°C)', 'value': 'temperatura (°C)'},
+                    {'label': 'Humedad Relativa (%)', 'value': 'humedad relativa (%)'},
+                    {'label': 'Presión Atmosférica (hPAS)', 'value': 'presión atmosferica (hPAS)'},
+                    {'label': 'Dirección del Viento (°)', 'value': 'direccion viento (°)'},
+                    {'label': 'Fuerza del Viento (kt)', 'value': 'fuerza viento (kt)'},
+                    {'label': 'Precipitación (mm)', 'value': 'precipitación (mm)'},
+                    {'label': 'Radiación (W/m²)', 'value': 'radiacion (W/m²)'}
+                ],
+                value='temperatura (°C)'
+            )
+        ], width=3),
+        dbc.Col([
+            dcc.Graph(id='mapa-interactivo')
+        ], width=9)
+    ]),
+    dbc.Row([
+        dbc.Col([
+            dcc.Graph(id='grafico-historico')
+        ])
+    ])
+], fluid=True)
+
+# Callback para actualizar el gráfico del mapa
+@app.callback(
+    Output('mapa-interactivo', 'figure'),
+    Input('variable-dropdown', 'value')
 )
+def actualizar_mapa(variable):
+    fig = px.scatter_mapbox(
+        geometrias_df,
+        lat='latitud',
+        lon='longitud',
+        hover_name='nombre de estacion',
+        hover_data={'region': True, 'comuna': True, 'cuenca DGA': True, 'altitud (m.s.n.m)': True},
+        zoom=6
+    )
+    fig.update_layout(mapbox_style="open-street-map")
+    return fig
 
-# Definir la función del servidor
-def server(input, output, session):
-    selected_station = reactive.Value(None)
-
-    @output
-    @render.ui
-    def map():
-        m = Map(zoom=6)  # Inicializar el mapa con un zoom arbitrario
-        markers = []
-        for idx, row in map_data.iterrows():
-            marker = Marker(location=(row['latitud'], row['longitud']), draggable=False)
-            marker.on_click(lambda event=None, idx=idx: selected_station.set(map_data.iloc[idx]['cod_estacion']))
-            popup_content = widgets.HTML(value=f"""
-                <b>Estación:</b> {row['nombre']}<br>
-                <b>Región:</b> {row['region']}<br>
-                <b>Comuna:</b> {row['comuna']}<br>
-                <b>Cuenca:</b> {row['sscuenca_dga']}<br>
-                <b>Altitud:</b> {row['altitud']} m.s.n.m.<br>
-                <b>Zona:</b> {row['zona']}
-            """)
-            marker.popup = Popup(location=marker.location, child=popup_content, close_button=False)
-            markers.append(marker)
-        marker_cluster = MarkerCluster(markers=markers)
-        m.add_layer(marker_cluster)
-        m.fit_bounds(bounds)  # Ajustar el mapa al bounding box calculado
-        html_file = '/tmp/map.html'
-        embed_minimal_html(html_file, views=[m], title='Mapa')
-        with open(html_file, 'r') as f:
-            return ui.HTML(f.read())
-
-    @output
-    @render.plot
-    def plot():
-        plt.figure()
-        if selected_station.get():
-            graph_data = fetch_graph_data(selected_station.get())
-            plt.plot(graph_data['fecha'], graph_data['temperatura (°C)'], 'o')
-            plt.xlabel('Fecha')
-            plt.ylabel('Temperatura (°C)')
-            plt.title(f'Temperatura en {selected_station.get()}')
+# Callback para actualizar el gráfico histórico
+@app.callback(
+    Output('grafico-historico', 'figure'),
+    Input('variable-dropdown', 'value'),
+    Input('mapa-interactivo', 'clickData')
+)
+def actualizar_grafico(variable, clickData):
+    if clickData is not None:
+        estacion_nombre = clickData['points'][0]['hovertext']
+        estacion_codigo = estacion_a_codigo.get(estacion_nombre, None)
+        print(f"Estación seleccionada: {estacion_nombre}, código: {estacion_codigo}")  # Verificar estación seleccionada
+        if estacion_codigo is not None:
+            df_filtrado = datos_historicos_df[datos_historicos_df['codigo de estacion'] == estacion_codigo]
+            print(df_filtrado.head())  # Verificar datos filtrados
+            fig = px.line(
+                df_filtrado,
+                x='mes',
+                y=variable,
+                title=f'{variable} en {estacion_nombre}'
+            )
         else:
-            plt.text(0.5, 0.5, 'Selecciona una estación en el mapa', horizontalalignment='center', verticalalignment='center')
-        return plt.gcf()
+            fig = px.line(
+                pd.DataFrame(columns=['mes', variable]),
+                x='mes',
+                y=variable,
+                title='No se encontró la estación seleccionada'
+            )
+    else:
+        fig = px.line(
+            pd.DataFrame(columns=['mes', variable]),
+            x='mes',
+            y=variable,
+            title='Selecciona una estación en el mapa'
+        )
+    return fig
 
-    @output
-    @render.table
-    def table():
-        if selected_station.get():
-            return fetch_graph_data(selected_station.get())
-        else:
-            return pd.DataFrame()
-
-# Crear el objeto de la aplicación
-app = App(app_ui, server)
-
-# Ejecutar la aplicación
 if __name__ == "__main__":
-    app.run()
+    app.run_server(debug=True)
